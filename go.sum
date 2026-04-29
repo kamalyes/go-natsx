@@ -12,8 +12,8 @@ github.com/kamalyes/go-jsonpath v0.0.0-20260129163507-0b67ed48bb28 h1:mftqfK+BB1
 github.com/kamalyes/go-jsonpath v0.0.0-20260129163507-0b67ed48bb28/go.mod h1:Yu4Vw7F4dOKlhHK5RzBHYDvoSRdeHJgVwAjqXHXu4p4=
 github.com/kamalyes/go-logger v0.4.6-0.20260320160038-f1cdda12311b h1:v4qTAltU5RF0AaPsVlAgtCPLqSz+K9jhHZkAc6eOD6g=
 github.com/kamalyes/go-logger v0.4.6-0.20260320160038-f1cdda12311b/go.mod h1:hC64n/eh9eNhz8aOJ1QXUMmZG21s66gyDx9EXw/i/Ng=
-github.com/kamalyes/go-toolbox v0.11.87-0.20260416011949-e35a4e01a90a h1:RHvmtxSQ6GxLkJsy+lFGkUHL+Kc6pujY4YfH4ITni44=
-github.com/kamalyes/go-toolbox v0.11.87-0.20260416011949-e35a4e01a90a/go.mod h1:T0toLZCP952jKKJFo8Rn+sZ9OktxxU7GYWFPpk/c98k=
+github.com/kamalyes/go-toolbox v0.11.88 h1:dn9OtigbmKalOx3nOwajJQNF9RaY8H0+ZhGxRwWBI0A=
+github.com/kamalyes/go-toolbox v0.11.88/go.mod h1:T0toLZCP952jKKJFo8Rn+sZ9OktxxU7GYWFPpk/c98k=
 github.com/klauspost/compress v1.17.9 h1:6KIumPrER1LHsvBVuDa0r5xaG0Es51mhhB9BQB2qeMA=
 github.com/klauspost/compress v1.17.9/go.mod h1:Di0epgTjJY877eYKx5yC51cX2A2Vl2ibi7bDH9ttBbw=
 github.com/kr/pretty v0.3.1 h1:flRD4NNwYAUpkphVc1HcthR4KEIFJ65n8Mw5qdRn3LE=
