@@ -4,15 +4,15 @@ go 1.25.0
 
 require (
 	github.com/json-iterator/go v1.1.12
-	github.com/kamalyes/go-logger v0.4.6
-	github.com/kamalyes/go-toolbox v0.12.0
+	github.com/kamalyes/go-logger v0.5.0
+	github.com/kamalyes/go-toolbox v0.15.0
 	github.com/nats-io/nats.go v1.39.1
 	github.com/stretchr/testify v1.11.1
 )
 
 require (
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
-	github.com/kamalyes/go-jsonpath v0.0.0-20260129163507-0b67ed48bb28 // indirect
+	github.com/kamalyes/go-argus v0.1.0 // indirect
 	github.com/klauspost/compress v1.17.9 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
