@@ -80,7 +80,9 @@ func (c *Client) InitWorkerPool(workers, queueSize int) {
 	if c.worker != nil {
 		return
 	}
-	c.worker = syncx.NewWorkerPool(workers, queueSize)
+	c.worker = syncx.NewWorkerPool(workers, queueSize, syncx.WithWorkerPoolPanicHandler(func(r interface{}) {
+		c.logger.Error("WorkerPool panic recovered: %v", r)
+	}))
 	c.logger.Info("WorkerPool initialized", "workers", workers, "queueSize", queueSize)
 }
 

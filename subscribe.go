@@ -172,7 +172,9 @@ func Subscribe[T any](c *Client, eventName, subscriberName string, handleFunc fu
 
 	var localPool *syncx.WorkerPool
 	if !subOpts.IsIntoGlobalPool {
-		localPool = syncx.NewWorkerPool(subOpts.LocalPoolSize, subOpts.LocalPoolQueueSize)
+		localPool = syncx.NewWorkerPool(subOpts.LocalPoolSize, subOpts.LocalPoolQueueSize, syncx.WithWorkerPoolPanicHandler(func(r interface{}) {
+			c.logger.Error("Local consumer pool panic recovered: %v", r)
+		}))
 	}
 
 	if !enabledJS {
@@ -279,7 +281,9 @@ func SubscribeStreamBatch[T any](c *Client, eventName, subscriberName string, ha
 
 	var localPool *syncx.WorkerPool
 	if !subOpts.IsIntoGlobalPool {
-		localPool = syncx.NewWorkerPool(subOpts.LocalPoolSize, subOpts.LocalPoolQueueSize)
+		localPool = syncx.NewWorkerPool(subOpts.LocalPoolSize, subOpts.LocalPoolQueueSize, syncx.WithWorkerPoolPanicHandler(func(r interface{}) {
+			c.logger.Error("Local consumer pool panic recovered: %v", r)
+		}))
 	}
 
 	sub, err := js.PullSubscribe(eventName, normalizeConsumerName(eventName+"_"+subscriberName))
@@ -339,6 +343,15 @@ func SubscribeStreamBatch[T any](c *Client, eventName, subscriberName string, ha
 // dispatchConsumer 分发单条消息到消费者池
 func dispatchConsumer[T any](c *Client, msg *nats.Msg, handleFunc func(*T) error, isManualAck bool, isIntoGlobalPool bool, localPool *syncx.WorkerPool, msgMaxRetry uint64, msgRetryInterval time.Duration) {
 	task := func() {
+		defer func() {
+			if r := recover(); r != nil {
+				c.logger.Error("Consumer panic recovered: %v, subject: %s", r, msg.Subject)
+				if isManualAck {
+					nakMsg(c, msg, msgMaxRetry, msgRetryInterval)
+				}
+			}
+		}()
+
 		var event T
 		if err := jsoniter.Unmarshal(msg.Data, &event); err != nil {
 			c.logger.Error("Unmarshal nats msg failed", "error", err)
@@ -377,6 +390,14 @@ func dispatchConsumer[T any](c *Client, msg *nats.Msg, handleFunc func(*T) error
 // dispatchBatchConsumer 分发批量消息到消费者池
 func dispatchBatchConsumer[T any](c *Client, messages []*nats.Msg, handleFunc func([]*T) error, isIntoGlobalPool bool, localPool *syncx.WorkerPool, msgMaxRetry uint64, msgRetryInterval time.Duration) {
 	task := func() {
+		defer func() {
+			if r := recover(); r != nil {
+				c.logger.Error("Batch consumer panic recovered: %v", r)
+				for _, msg := range messages {
+					nakMsg(c, msg, msgMaxRetry, msgRetryInterval)
+				}
+			}
+		}()
 		_ = handleStreamBatch(c, messages, handleFunc, msgMaxRetry, msgRetryInterval)
 	}
 
