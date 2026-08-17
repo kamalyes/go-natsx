@@ -4,8 +4,8 @@ go 1.25.0
 
 require (
 	github.com/json-iterator/go v1.1.12
-	github.com/kamalyes/go-logger v0.5.8
-	github.com/kamalyes/go-toolbox v0.15.9
+	github.com/kamalyes/go-logger v0.5.9
+	github.com/kamalyes/go-toolbox v0.16.0
 	github.com/nats-io/nats.go v1.39.1
 	github.com/stretchr/testify v1.11.1
 )
