@@ -28,6 +28,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"math/rand"
 	"strings"
 	"time"
 
@@ -41,6 +43,15 @@ import (
 // 依赖倒置设计：库自身不感知具体实现，由应用侧传入（如桥接网关中间件的 trace 逻辑）
 type ContextInjector func(ctx context.Context, msg *nats.Msg) context.Context
 
+// Backoff 重试退避策略（指数退避 + 抖动）
+// 设置后退避计算优先于 MsgRetryInterval 固定间隔
+type Backoff struct {
+	Base   time.Duration // 首次重试延迟
+	Max    time.Duration // 延迟上限
+	Factor float64       // 指数因子（每次延迟 = 上次 * Factor，<=0 时按 2.0 处理）
+	Jitter bool          // 是否叠加 0~1 倍随机抖动，避免重投风暴同步
+}
+
 // SubscribeOptions 订阅选项
 type SubscribeOptions struct {
 	IsListenBroadcast  bool            // 是否广播方式监听
@@ -50,8 +61,9 @@ type SubscribeOptions struct {
 	BatchSize          int             // 批量消费的最大数量
 	MaxWait            time.Duration   // 批量消费最大等待消息时间
 	ConsumeFastest     bool            // 批量消费时是否尽快消费
-	MsgMaxRetry        uint64          // 消息消费失败最大重试次数
-	MsgRetryInterval   time.Duration   // 消息消费重试的时间间隔
+	MsgMaxRetry        uint64          // 消息消费失败最大重试次数（0 表示无限重投，见 WithUnlimitedDelivery）
+	MsgRetryInterval   time.Duration   // 消息消费重试的时间间隔（固定间隔模式）
+	RetryBackoff       *Backoff        // 指数退避模式（设置后优先于 MsgRetryInterval）
 	MaxAckWait         time.Duration   // 消息最长消费时间（同时作为消息级 ctx 的 deadline）
 	IdleHeartbeat      time.Duration   // 消费者心跳时间
 	EnabledFlowControl bool            // 是否开启流控机制
@@ -117,10 +129,29 @@ func WithMsgMaxRetry(msgMaxRetry uint64) ApplySubOptsFunc {
 	}
 }
 
-// WithMsgRetryInterval 设置消息重试间隔
+// WithUnlimitedDelivery 无限重投模式
+// 语义：消息消费失败后永远 Nak 重投，永不 Term（适用于资金、账务等不可丢失的消费场景）。
+// 实现上等价于 MsgMaxRetry=0；与 WithMsgMaxRetry 互斥，后调用者生效
+func WithUnlimitedDelivery() ApplySubOptsFunc {
+	return func(opt *SubscribeOptions) {
+		opt.MsgMaxRetry = 0
+	}
+}
+
+// WithMsgRetryInterval 设置消息重试间隔（固定间隔模式）
+// 需要指数退避时改用 WithRetryBackoff，两者同时设置时退避优先
 func WithMsgRetryInterval(msgRetryInterval time.Duration) ApplySubOptsFunc {
 	return func(opt *SubscribeOptions) {
 		opt.MsgRetryInterval = msgRetryInterval
+	}
+}
+
+// WithRetryBackoff 设置指数退避重试策略
+// 延迟序列：Base, Base*Factor, Base*Factor², ... 封顶于 Max；可选抖动打散重投风暴
+func WithRetryBackoff(backoff Backoff) ApplySubOptsFunc {
+	return func(opt *SubscribeOptions) {
+		value := backoff
+		opt.RetryBackoff = &value
 	}
 }
 
@@ -400,7 +431,7 @@ func dispatchConsumer[T any](ctx context.Context, c *Client, msg *nats.Msg, hand
 			if r := recover(); r != nil {
 				c.logger.Error("Consumer panic recovered: %v, subject: %s", r, msg.Subject)
 				if isManualAck {
-					nakMsg(c, msg, subOpts.MsgMaxRetry, subOpts.MsgRetryInterval)
+					nakMsgWithOpts(c, msg, subOpts, nil)
 				}
 			}
 		}()
@@ -409,7 +440,8 @@ func dispatchConsumer[T any](ctx context.Context, c *Client, msg *nats.Msg, hand
 		if err := jsoniter.Unmarshal(msg.Data, &event); err != nil {
 			c.logger.Error("Unmarshal nats msg failed", "error", err)
 			if isManualAck {
-				nakMsg(c, msg, subOpts.MsgMaxRetry, subOpts.MsgRetryInterval)
+				// 反序列化失败 = 消息体损坏，重试不可修复，按永久性失败终止
+				nakMsgWithOpts(c, msg, subOpts, fmt.Errorf("%w: unmarshal failed", ErrPermanent))
 			}
 			return
 		}
@@ -420,7 +452,7 @@ func dispatchConsumer[T any](ctx context.Context, c *Client, msg *nats.Msg, hand
 				c.logger.Error("Nats msg handle failed with ctx done", "subject", msg.Subject, "ctx_error", msgCtx.Err(), "error", err)
 			}
 			if isManualAck {
-				nakMsg(c, msg, subOpts.MsgMaxRetry, subOpts.MsgRetryInterval)
+				nakMsgWithOpts(c, msg, subOpts, err)
 			}
 			return
 		}
@@ -455,7 +487,7 @@ func dispatchBatchConsumer[T any](ctx context.Context, c *Client, messages []*na
 			if r := recover(); r != nil {
 				c.logger.Error("Batch consumer panic recovered: %v", r)
 				for _, msg := range messages {
-					nakMsg(c, msg, subOpts.MsgMaxRetry, subOpts.MsgRetryInterval)
+					nakMsgWithOpts(c, msg, subOpts, nil)
 				}
 			}
 		}()
@@ -485,7 +517,8 @@ func handleStreamBatch[T any](ctx context.Context, c *Client, messages []*nats.M
 		event := new(T)
 		if err := jsoniter.Unmarshal(msg.Data, event); err != nil {
 			c.logger.Error("Unmarshal nats msg failed", "error", err)
-			nakMsg(c, msg, subOpts.MsgMaxRetry, subOpts.MsgRetryInterval)
+			// 消息体损坏重试不可修复，单独终止该条，不影响批内其余消息
+			nakMsgWithOpts(c, msg, subOpts, fmt.Errorf("%w: unmarshal failed", ErrPermanent))
 			continue
 		}
 		events = append(events, event)
@@ -501,7 +534,7 @@ func handleStreamBatch[T any](ctx context.Context, c *Client, messages []*nats.M
 			c.logger.Error("Nats batch handle failed with ctx done", "ctx_error", ctx.Err(), "error", err)
 		}
 		for _, msg := range validMessages {
-			nakMsg(c, msg, subOpts.MsgMaxRetry, subOpts.MsgRetryInterval)
+			nakMsgWithOpts(c, msg, subOpts, err)
 		}
 		return err
 	}
@@ -515,26 +548,90 @@ func handleStreamBatch[T any](ctx context.Context, c *Client, messages []*nats.M
 	return nil
 }
 
-// nakMsg NAK 消息，支持重试
-func nakMsg(c *Client, msg *nats.Msg, msgMaxRetry uint64, msgRetryInterval time.Duration) {
-	if msgMaxRetry > 0 {
-		if deliveryCount, err := msg.Metadata(); err == nil && deliveryCount.NumDelivered > msgMaxRetry {
-			if err := msg.Term(); err != nil {
-				c.logger.Error("Term msg failed", "error", err)
+// nakMsgWithOpts 应答决策表：根据错误性质与订阅选项决定 Term / NakWithDelay / Nak
+// err 为 nil 或未命中 ErrPermanent → 重试路径（退避策略优先于固定间隔）
+// err 命中 ErrPermanent → 直接 Term 终止（重试不可修复的场景）
+// msgMaxRetry=0（无限重投模式）下除 ErrPermanent 外永不 Term
+func nakMsgWithOpts(c *Client, msg *nats.Msg, subOpts SubscribeOptions, err error) {
+	if err != nil && errors.Is(err, ErrPermanent) {
+		if termErr := msg.Term(); termErr != nil {
+			c.logger.Error("Term msg failed", "error", termErr)
+		}
+		return
+	}
+
+	if subOpts.MsgMaxRetry > 0 {
+		if metadata, metaErr := msg.Metadata(); metaErr == nil && metadata.NumDelivered > subOpts.MsgMaxRetry {
+			if termErr := msg.Term(); termErr != nil {
+				c.logger.Error("Term msg failed", "error", termErr)
 			}
 			return
 		}
 	}
 
-	var err error
-	if msgRetryInterval > 0 {
-		err = msg.NakWithDelay(msgRetryInterval)
+	delay := retryDelay(subOpts, msg)
+	var nakErr error
+	if delay > 0 {
+		nakErr = msg.NakWithDelay(delay)
 	} else {
-		err = msg.Nak()
+		nakErr = msg.Nak()
 	}
+	if nakErr != nil {
+		c.logger.Error("Nats msg nak error", "error", nakErr)
+	}
+}
+
+// retryDelay 计算本次重试延迟：退避策略优先，其次固定间隔，均未设置立即重投
+func retryDelay(subOpts SubscribeOptions, msg *nats.Msg) time.Duration {
+	if backoff := subOpts.RetryBackoff; backoff != nil {
+		return backoff.delayFor(deliveryCount(msg))
+	}
+	return subOpts.MsgRetryInterval
+}
+
+// delayFor 按投递次数计算指数退避延迟（首次投递失败 → Base，其后逐次 ×Factor，封顶 Max）
+func (b Backoff) delayFor(delivery uint64) time.Duration {
+	if b.Base <= 0 {
+		return 0
+	}
+	factor := b.Factor
+	if factor <= 0 {
+		factor = 2.0
+	}
+	// 先封顶指数，避免大 delivery 时 math.Pow 溢出 time.Duration 范围产生负值
+	maxExp := math.Log(math.MaxInt64/float64(b.Base)) / math.Log(factor)
+	exp := float64(max(delivery, 1) - 1)
+	if exp > maxExp {
+		exp = maxExp
+	}
+	// delivery 从 1 起：首次失败延迟 = Base，第 n 次失败延迟 = Base * Factor^(n-1)
+	delay := time.Duration(float64(b.Base) * math.Pow(factor, exp))
+	if b.Max > 0 && delay > b.Max {
+		delay = b.Max
+	}
+	if b.Jitter && delay > 0 {
+		// 0~1 倍抖动：打散同批失败消息的同步重投
+		delay = time.Duration(rand.Int63n(int64(delay) + 1))
+	}
+	return delay
+}
+
+// DeliveryCount 返回消息当前投递次数（1 = 首次投递）
+// 非 JetStream 消息（Core NATS 模式）无投递元数据，返回 0
+func DeliveryCount(msg *nats.Msg) uint64 {
+	return deliveryCount(msg)
+}
+
+// deliveryCount 读取 JetStream 投递元数据中的投递次数
+func deliveryCount(msg *nats.Msg) uint64 {
+	if msg == nil {
+		return 0
+	}
+	metadata, err := msg.Metadata()
 	if err != nil {
-		c.logger.Error("Nats msg nak error", "error", err)
+		return 0
 	}
+	return metadata.NumDelivered
 }
 
 // normalizeConsumerName 规范化消费者名称

@@ -25,4 +25,10 @@ var (
 	ErrTimeout                  = errors.New("nats: operation timed out")
 	ErrUnavailable              = errors.New("nats: service unavailable")
 	ErrGlobalPoolNotInitialized = errors.New("nats: global consumer pool not initialized, call InitWorkerPool first")
+
+	// ErrPermanent 永久性失败哨兵错误
+	// handler 返回 errors.Is 命中此哨兵的错误时，库直接 Term 终止消息（不再重投），
+	// 与 Nak 重试路径区分：格式损坏、业务上无法匹配等重试不可修复的场景
+	// 用法：return fmt.Errorf("%w: order not found", natsx.ErrPermanent)
+	ErrPermanent = errors.New("nats: permanent failure, message will be terminated")
 )

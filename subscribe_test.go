@@ -12,6 +12,8 @@ package natsx
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -167,6 +169,86 @@ func TestSubscribeOptions_WithContextInjector(t *testing.T) {
 	}
 	WithContextInjector(inj)(&opts)
 	assert.NotNil(t, opts.ContextInjector)
+}
+
+// TestSubscribeOptions_WithUnlimitedDelivery 测试无限重投模式
+func TestSubscribeOptions_WithUnlimitedDelivery(t *testing.T) {
+	opts := DefaultSubscribeOptions()
+	assert.Equal(t, uint64(3), opts.MsgMaxRetry)
+
+	WithUnlimitedDelivery()(&opts)
+	assert.Equal(t, uint64(0), opts.MsgMaxRetry, "unlimited delivery should set MsgMaxRetry to 0")
+
+	// 与 WithMsgMaxRetry 的覆盖顺序：后调用者生效
+	WithMsgMaxRetry(5)(&opts)
+	assert.Equal(t, uint64(5), opts.MsgMaxRetry)
+	WithUnlimitedDelivery()(&opts)
+	assert.Equal(t, uint64(0), opts.MsgMaxRetry)
+}
+
+// TestSubscribeOptions_WithRetryBackoff 测试指数退避选项
+func TestSubscribeOptions_WithRetryBackoff(t *testing.T) {
+	opts := DefaultSubscribeOptions()
+	assert.Nil(t, opts.RetryBackoff)
+
+	WithRetryBackoff(Backoff{Base: time.Second, Max: 30 * time.Second})(&opts)
+	assert.NotNil(t, opts.RetryBackoff)
+	assert.Equal(t, time.Second, opts.RetryBackoff.Base)
+	assert.Equal(t, 30*time.Second, opts.RetryBackoff.Max)
+}
+
+// TestBackoffDelayFor 测试指数退避延迟计算
+func TestBackoffDelayFor(t *testing.T) {
+	backoff := Backoff{Base: 2 * time.Second, Max: 30 * time.Second, Factor: 2.0}
+
+	assert.Equal(t, 2*time.Second, backoff.delayFor(1), "first delivery failure should return Base")
+	assert.Equal(t, 4*time.Second, backoff.delayFor(2), "second failure should double")
+	assert.Equal(t, 8*time.Second, backoff.delayFor(3))
+	assert.Equal(t, 30*time.Second, backoff.delayFor(10), "should cap at Max")
+	assert.Equal(t, 30*time.Second, backoff.delayFor(100), "should stay capped far beyond Max")
+
+	// Factor 未设置时默认 2.0
+	defaultFactor := Backoff{Base: time.Second, Max: 10 * time.Second}
+	assert.Equal(t, 4*time.Second, defaultFactor.delayFor(3), "default factor should be 2.0")
+
+	// Base 未设置时禁用退避
+	noBase := Backoff{Max: time.Second}
+	assert.Equal(t, time.Duration(0), noBase.delayFor(5), "zero Base should disable backoff")
+
+	// 抖动模式下延迟不超过无抖动值
+	jittered := Backoff{Base: 10 * time.Second, Max: 10 * time.Second, Jitter: true}
+	for i := 0; i < 100; i++ {
+		delay := jittered.delayFor(3)
+		assert.GreaterOrEqual(t, delay, time.Duration(0))
+		assert.LessOrEqual(t, delay, 10*time.Second, "jittered delay must not exceed capped value")
+	}
+}
+
+// TestDeliveryCount 测试投递次数读取（非 JetStream 消息返回 0）
+func TestDeliveryCount(t *testing.T) {
+	assert.Equal(t, uint64(0), DeliveryCount(nil), "nil msg should return 0")
+
+	msg := &nats.Msg{Subject: "test.subject", Data: []byte(`{}`)}
+	// Core NATS 消息没有 JetStream 元数据（reply 为空且非 ACK subject）
+	assert.Equal(t, uint64(0), DeliveryCount(msg), "core NATS msg without metadata should return 0")
+}
+
+// TestRetryDelayPriority 测试延迟计算优先级：退避策略 > 固定间隔
+func TestRetryDelayPriority(t *testing.T) {
+	msg := &nats.Msg{Subject: "test.subject"}
+
+	// 均未设置：立即重投
+	assert.Equal(t, time.Duration(0), retryDelay(SubscribeOptions{}, msg))
+
+	// 仅固定间隔
+	assert.Equal(t, 3*time.Second, retryDelay(SubscribeOptions{MsgRetryInterval: 3 * time.Second}, msg))
+
+	// 退避优先于固定间隔
+	subOpts := SubscribeOptions{
+		MsgRetryInterval: 3 * time.Second,
+		RetryBackoff:     &Backoff{Base: time.Second, Max: time.Minute},
+	}
+	assert.Equal(t, time.Second, retryDelay(subOpts, msg), "backoff should take precedence over fixed interval")
 }
 
 // TestDeriveMessageContext_InjectorAndDeadline 测试消息级 ctx 派生：注入器生效 + AckWait 对齐 deadline
@@ -590,4 +672,79 @@ func TestSubscribeBroadcast_WithJetStream(t *testing.T) {
 		return nil
 	}, WithMaxAckWait(30*time.Second), WithIdleHeartbeat(5*time.Second))
 	assert.NoError(t, err)
+}
+
+// TestSubscribe_ErrPermanent_TerminatesMessage 测试 ErrPermanent 哨兵错误触发 Term（不再重投）
+func TestSubscribe_ErrPermanent_TerminatesMessage(t *testing.T) {
+	client, conn := newConnectedClientWithJS(t)
+	defer client.Close()
+	defer conn.Close()
+
+	streamName := "TEST_PERMANENT_JS"
+	ensureStream(t, client, streamName)
+
+	type TestEvent struct {
+		Name string `json:"name"`
+	}
+
+	subject := streamName + ".permanent"
+	var attempts atomic.Int32
+
+	err := Subscribe(context.Background(), client, subject, "testing_permanent",
+		func(ctx context.Context, evt *TestEvent) error {
+			attempts.Add(1)
+			// 模拟业务上无法匹配的场景：声明永久性失败，库应 Term 终止而非 Nak 重投
+			return fmt.Errorf("%w: order not found for %s", ErrPermanent, evt.Name)
+		},
+		WithMaxAckWait(5*time.Second),
+		WithUnlimitedDelivery(), // 无限重投模式下 ErrPermanent 仍应 Term
+	)
+	assert.NoError(t, err)
+
+	err = PublishEvent(client, subject, &TestEvent{Name: "orphan"})
+	assert.NoError(t, err)
+
+	// 等待足够多的潜在重投窗口（若有 Nak 重投，attempts 会持续增长）
+	time.Sleep(2 * time.Second)
+	assert.LessOrEqual(t, attempts.Load(), int32(1),
+		"ErrPermanent should terminate the message, no redelivery expected (attempts=%d)", attempts.Load())
+}
+
+// TestSubscribe_TemporaryError_RetriesWithBackoff 测试临时错误按退避策略 Nak 重投
+func TestSubscribe_TemporaryError_RetriesWithBackoff(t *testing.T) {
+	client, conn := newConnectedClientWithJS(t)
+	defer client.Close()
+	defer conn.Close()
+
+	streamName := "TEST_BACKOFF_JS"
+	ensureStream(t, client, streamName)
+
+	type TestEvent struct {
+		Name string `json:"name"`
+	}
+
+	subject := streamName + ".backoff"
+	var attempts atomic.Int32
+	var firstDelivery atomic.Int64
+
+	err := Subscribe(context.Background(), client, subject, "testing_backoff",
+		func(ctx context.Context, evt *TestEvent) error {
+			if attempts.Add(1) == 1 {
+				firstDelivery.Store(time.Now().UnixMilli())
+				return errors.New("transient: db lock timeout") // 临时错误：应 Nak 重投
+			}
+			return nil // 第二次成功
+		},
+		WithMaxAckWait(5*time.Second),
+		WithRetryBackoff(Backoff{Base: 200 * time.Millisecond, Max: time.Second}),
+	)
+	assert.NoError(t, err)
+
+	err = PublishEvent(client, subject, &TestEvent{Name: "retry-me"})
+	assert.NoError(t, err)
+
+	// 等待重投 + 二次成功
+	time.Sleep(2 * time.Second)
+	assert.GreaterOrEqual(t, attempts.Load(), int32(2),
+		"transient error should be redelivered via Nak (attempts=%d)", attempts.Load())
 }
