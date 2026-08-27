@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -155,6 +156,123 @@ func TestSubscribeOptions_Chained(t *testing.T) {
 	assert.Equal(t, 50, opts.LocalPoolQueueSize)
 }
 
+// TestSubscribeOptions_WithContextInjector 测试消息级上下文注入器选项
+func TestSubscribeOptions_WithContextInjector(t *testing.T) {
+	opts := DefaultSubscribeOptions()
+	assert.Nil(t, opts.ContextInjector)
+
+	type ctxKey struct{}
+	inj := func(ctx context.Context, msg *nats.Msg) context.Context {
+		return context.WithValue(ctx, ctxKey{}, "injected")
+	}
+	WithContextInjector(inj)(&opts)
+	assert.NotNil(t, opts.ContextInjector)
+}
+
+// TestDeriveMessageContext_InjectorAndDeadline 测试消息级 ctx 派生：注入器生效 + AckWait 对齐 deadline
+func TestDeriveMessageContext_InjectorAndDeadline(t *testing.T) {
+	type ctxKey struct{}
+
+	subOpts := DefaultSubscribeOptions()
+	subOpts.MaxAckWait = 50 * time.Millisecond
+	subOpts.ContextInjector = func(ctx context.Context, msg *nats.Msg) context.Context {
+		return context.WithValue(ctx, ctxKey{}, msg.Subject)
+	}
+
+	msg := &nats.Msg{Subject: "test.subject"}
+	derived, cancel := deriveMessageContext(context.Background(), subOpts, msg)
+	defer cancel()
+
+	// 注入器的值可见
+	assert.Equal(t, "test.subject", derived.Value(ctxKey{}))
+	// deadline 与 AckWait 对齐（近似断言，容忍调度误差）
+	dl, ok := derived.Deadline()
+	assert.True(t, ok, "message ctx should carry a deadline aligned with MaxAckWait")
+	assert.WithinDuration(t, time.Now().Add(50*time.Millisecond), dl, 20*time.Millisecond)
+
+	// 超时后 ctx 取消（模拟「处理慢于重投窗口」的快速失败）
+	time.Sleep(60 * time.Millisecond)
+	assert.ErrorIs(t, derived.Err(), context.DeadlineExceeded)
+}
+
+// TestDeriveMessageContext_BaseContextPropagation 测试订阅级 base ctx 的取消向下传播
+func TestDeriveMessageContext_BaseContextPropagation(t *testing.T) {
+	subOpts := DefaultSubscribeOptions()
+	subOpts.MaxAckWait = 0 // 无 AckWait 时退化为 WithCancel，仅随 base ctx 取消
+
+	baseCtx, baseCancel := context.WithCancel(context.Background())
+	derived, cancel := deriveMessageContext(baseCtx, subOpts, nil)
+	defer cancel()
+
+	baseCancel()
+	assert.ErrorIs(t, derived.Err(), context.Canceled)
+}
+
+// TestSubscribe_InjectorReceivesMessage 测试注入器收到真实消息（Core NATS 路径）
+func TestSubscribe_InjectorReceivesMessage(t *testing.T) {
+	client, conn := newConnectedClient(t)
+	defer client.Close()
+	defer conn.Close()
+
+	type TestEvent struct {
+		Name string `json:"name"`
+	}
+
+	subject := uniqueSubject("test.sub.injector")
+	var injectedSubject atomic.Value
+	var received atomic.Int32
+
+	err := Subscribe(context.Background(), client, subject, "testing",
+		func(ctx context.Context, evt *TestEvent) error {
+			received.Add(1)
+			return nil
+		},
+		WithContextInjector(func(ctx context.Context, msg *nats.Msg) context.Context {
+			injectedSubject.Store(msg.Subject)
+			return ctx
+		}),
+	)
+	assert.NoError(t, err)
+
+	err = PublishEvent(client, subject, &TestEvent{Name: "hello"})
+	assert.NoError(t, err)
+
+	time.Sleep(200 * time.Millisecond)
+	assert.Equal(t, int32(1), received.Load())
+	assert.Equal(t, subject, injectedSubject.Load(), "injector should receive the raw nats message")
+}
+
+// TestSubscribe_HandlerContextCancelledOnTimeout 测试 handler ctx 超时快速失败（Core NATS 路径退化为超时熔断）
+func TestSubscribe_HandlerContextCancelledOnTimeout(t *testing.T) {
+	client, conn := newConnectedClient(t)
+	defer client.Close()
+	defer conn.Close()
+
+	type TestEvent struct {
+		Name string `json:"name"`
+	}
+
+	subject := uniqueSubject("test.sub.deadline")
+	var ctxErr atomic.Value
+
+	err := Subscribe(context.Background(), client, subject, "testing",
+		func(ctx context.Context, evt *TestEvent) error {
+			<-ctx.Done() // 模拟慢处理，等待库派生的 deadline 触发
+			ctxErr.Store(ctx.Err())
+			return ctx.Err()
+		},
+		WithMaxAckWait(100*time.Millisecond),
+	)
+	assert.NoError(t, err)
+
+	err = PublishEvent(client, subject, &TestEvent{Name: "slow"})
+	assert.NoError(t, err)
+
+	time.Sleep(300 * time.Millisecond)
+	assert.ErrorIs(t, ctxErr.Load().(error), context.DeadlineExceeded,
+		"handler ctx should be cancelled after MaxAckWait deadline")
+}
+
 // TestSubscribe_BroadcastOverridesPoolSettings 测试广播模式在 Subscribe 内部覆盖池设置
 func TestSubscribe_BroadcastOverridesPoolSettings(t *testing.T) {
 	opts := DefaultSubscribeOptions()
@@ -177,7 +295,7 @@ func TestSubscribe_GlobalPoolNotInitialized(t *testing.T) {
 		Name string
 	}
 
-	err := Subscribe(client, "test.event", "testing", func(evt *TestEvent) error {
+	err := Subscribe(context.Background(), client, "test.event", "testing", func(ctx context.Context, evt *TestEvent) error {
 		return nil
 	}, WithIntoGlobalPool())
 	assert.ErrorIs(t, err, ErrGlobalPoolNotInitialized)
@@ -191,7 +309,7 @@ func TestSubscribe_NotConnected(t *testing.T) {
 		Name string
 	}
 
-	err := Subscribe(client, "test.event", "testing", func(evt *TestEvent) error {
+	err := Subscribe(context.Background(), client, "test.event", "testing", func(ctx context.Context, evt *TestEvent) error {
 		return nil
 	})
 	assert.ErrorIs(t, err, ErrNotConnected)
@@ -209,7 +327,7 @@ func TestSubscribe_Success_CoreNATS(t *testing.T) {
 
 	subject := uniqueSubject("test.sub")
 
-	err := Subscribe(client, subject, "testing", func(evt *TestEvent) error {
+	err := Subscribe(context.Background(), client, subject, "testing", func(ctx context.Context, evt *TestEvent) error {
 		return nil
 	})
 	assert.NoError(t, err)
@@ -228,7 +346,7 @@ func TestSubscribe_ReceiveMessage(t *testing.T) {
 	subject := uniqueSubject("test.sub.recv")
 	var received atomic.Int32
 
-	err := Subscribe(client, subject, "testing", func(evt *TestEvent) error {
+	err := Subscribe(context.Background(), client, subject, "testing", func(ctx context.Context, evt *TestEvent) error {
 		received.Add(1)
 		return nil
 	})
@@ -253,7 +371,7 @@ func TestSubscribeBroadcast_Success_CoreNATS(t *testing.T) {
 
 	subject := uniqueSubject("test.broadcast")
 
-	err := SubscribeBroadcast(client, subject, func(evt *TestEvent) error {
+	err := SubscribeBroadcast(context.Background(), client, subject, func(ctx context.Context, evt *TestEvent) error {
 		return nil
 	})
 	assert.NoError(t, err)
@@ -272,7 +390,7 @@ func TestSubscribeBroadcast_ReceiveMessage(t *testing.T) {
 	subject := uniqueSubject("test.broadcast.recv")
 	var received atomic.Int32
 
-	err := SubscribeBroadcast(client, subject, func(evt *TestEvent) error {
+	err := SubscribeBroadcast(context.Background(), client, subject, func(ctx context.Context, evt *TestEvent) error {
 		received.Add(1)
 		return nil
 	})
@@ -298,13 +416,13 @@ func TestSubscribeBroadcast_MultipleSubscribers(t *testing.T) {
 	subject := uniqueSubject("test.broadcast.multi")
 	var received1, received2 atomic.Int32
 
-	err := SubscribeBroadcast(client, subject, func(evt *TestEvent) error {
+	err := SubscribeBroadcast(context.Background(), client, subject, func(ctx context.Context, evt *TestEvent) error {
 		received1.Add(1)
 		return nil
 	})
 	assert.NoError(t, err)
 
-	err = SubscribeBroadcast(client, subject, func(evt *TestEvent) error {
+	err = SubscribeBroadcast(context.Background(), client, subject, func(ctx context.Context, evt *TestEvent) error {
 		received2.Add(1)
 		return nil
 	})
@@ -328,7 +446,7 @@ func TestSubscribeStreamBatch_JetStreamNotEnabled(t *testing.T) {
 		Name string
 	}
 
-	err := SubscribeStreamBatch(client, "test.event", "testing", func(evts []*TestEvent) error {
+	err := SubscribeStreamBatch(context.Background(), client, "test.event", "testing", func(ctx context.Context, evts []*TestEvent) error {
 		return nil
 	})
 	assert.ErrorIs(t, err, ErrJetStreamFailed)
@@ -344,7 +462,7 @@ func TestSubscribeStreamBatch_GlobalPoolNotInitialized(t *testing.T) {
 		Name string
 	}
 
-	err := SubscribeStreamBatch(client, "test.event", "testing", func(evts []*TestEvent) error {
+	err := SubscribeStreamBatch(context.Background(), client, "test.event", "testing", func(ctx context.Context, evts []*TestEvent) error {
 		return nil
 	}, WithIntoGlobalPool())
 	assert.ErrorIs(t, err, ErrGlobalPoolNotInitialized)
@@ -366,7 +484,7 @@ func TestSubscribeStreamBatch_Success(t *testing.T) {
 	subject := streamName + ".test"
 	var received atomic.Int32
 
-	err := SubscribeStreamBatch(client, subject, "testing", func(evts []*TestEvent) error {
+	err := SubscribeStreamBatch(context.Background(), client, subject, "testing", func(ctx context.Context, evts []*TestEvent) error {
 		received.Add(int32(len(evts)))
 		return nil
 	}, WithBatchSize(10), WithMaxWait(2*time.Second))
@@ -396,7 +514,7 @@ func TestSubscribe_WithGlobalPool(t *testing.T) {
 	subject := uniqueSubject("test.global.pool")
 	var received atomic.Int32
 
-	err := Subscribe(client, subject, "testing", func(evt *TestEvent) error {
+	err := Subscribe(context.Background(), client, subject, "testing", func(ctx context.Context, evt *TestEvent) error {
 		received.Add(1)
 		return nil
 	}, WithIntoGlobalPool())
@@ -421,7 +539,7 @@ func TestSubscribe_MultipleOptions(t *testing.T) {
 
 	subject := uniqueSubject("test.opts")
 
-	err := Subscribe(client, subject, "testing", func(evt *TestEvent) error {
+	err := Subscribe(context.Background(), client, subject, "testing", func(ctx context.Context, evt *TestEvent) error {
 		return nil
 	},
 		WithLocalPoolSize(3, 50),
@@ -447,7 +565,7 @@ func TestSubscribe_WithJetStream(t *testing.T) {
 
 	subject := streamName + ".test"
 
-	err := Subscribe(client, subject, "testing", func(evt *TestEvent) error {
+	err := Subscribe(context.Background(), client, subject, "testing", func(ctx context.Context, evt *TestEvent) error {
 		return nil
 	}, WithMaxAckWait(30*time.Second))
 	assert.NoError(t, err)
@@ -468,7 +586,7 @@ func TestSubscribeBroadcast_WithJetStream(t *testing.T) {
 
 	subject := streamName + ".test"
 
-	err := SubscribeBroadcast(client, subject, func(evt *TestEvent) error {
+	err := SubscribeBroadcast(context.Background(), client, subject, func(ctx context.Context, evt *TestEvent) error {
 		return nil
 	}, WithMaxAckWait(30*time.Second), WithIdleHeartbeat(5*time.Second))
 	assert.NoError(t, err)

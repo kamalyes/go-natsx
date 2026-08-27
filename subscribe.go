@@ -11,6 +11,11 @@
  *   - SubscribeBroadcast：广播事件订阅（Subscribe 模式），所有订阅者都收到消息
  *   - SubscribeStreamBatch：批量流式消费（JetStream Pull 模式），支持批量拉取
  *
+ * 上下文传播（ctx 分层）：
+ *   - 订阅级 base ctx：随调用方传入，取消即停止消费（优雅停机）
+ *   - 消息级 ctx：每条消息从 base ctx 派生，先经 ContextInjector 注入（如 trace_id），
+ *     再叠加与 MaxAckWait 对齐的 deadline，消除「handler 仍在跑但 JetStream 已重投」的双活窗口
+ *
  * 消费者池：
  *   - 局部消费者池：每个订阅创建独立 WorkerPool 处理消息
  *   - 全局消费者池：共享 Client 级别的 WorkerPool，通过 InitWorkerPool 初始化
@@ -31,20 +36,26 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
+// ContextInjector 消息级上下文注入器
+// 每条消息分发前调用，用于从消息 Header 继承跨服务上下文（如 trace_id）或注入自定义值
+// 依赖倒置设计：库自身不感知具体实现，由应用侧传入（如桥接网关中间件的 trace 逻辑）
+type ContextInjector func(ctx context.Context, msg *nats.Msg) context.Context
+
 // SubscribeOptions 订阅选项
 type SubscribeOptions struct {
-	IsListenBroadcast  bool          // 是否广播方式监听
-	IsIntoGlobalPool   bool          // 是否进入全局消费者池中消费
-	LocalPoolSize      int           // 局部消费者池大小
-	LocalPoolQueueSize int           // 局部消费者池队列大小
-	BatchSize          int           // 批量消费的最大数量
-	MaxWait            time.Duration // 批量消费最大等待消息时间
-	ConsumeFastest     bool          // 批量消费时是否尽快消费
-	MsgMaxRetry        uint64        // 消息消费失败最大重试次数
-	MsgRetryInterval   time.Duration // 消息消费重试的时间间隔
-	MaxAckWait         time.Duration // 消息最长消费时间
-	IdleHeartbeat      time.Duration // 消费者心跳时间
-	EnabledFlowControl bool          // 是否开启流控机制
+	IsListenBroadcast  bool            // 是否广播方式监听
+	IsIntoGlobalPool   bool            // 是否进入全局消费者池中消费
+	LocalPoolSize      int             // 局部消费者池大小
+	LocalPoolQueueSize int             // 局部消费者池队列大小
+	BatchSize          int             // 批量消费的最大数量
+	MaxWait            time.Duration   // 批量消费最大等待消息时间
+	ConsumeFastest     bool            // 批量消费时是否尽快消费
+	MsgMaxRetry        uint64          // 消息消费失败最大重试次数
+	MsgRetryInterval   time.Duration   // 消息消费重试的时间间隔
+	MaxAckWait         time.Duration   // 消息最长消费时间（同时作为消息级 ctx 的 deadline）
+	IdleHeartbeat      time.Duration   // 消费者心跳时间
+	EnabledFlowControl bool            // 是否开启流控机制
+	ContextInjector    ContextInjector // 消息级 ctx 注入器（如注入 trace_id）
 }
 
 // DefaultSubscribeOptions 返回默认订阅选项
@@ -114,6 +125,7 @@ func WithMsgRetryInterval(msgRetryInterval time.Duration) ApplySubOptsFunc {
 }
 
 // WithMaxAckWait 设置消息最长消费时间
+// 同时决定消息级 ctx 的 deadline：处理超时 → ctx 先取消 → handler 快速失败 → Nak 重投
 func WithMaxAckWait(maxAckWait time.Duration) ApplySubOptsFunc {
 	return func(opt *SubscribeOptions) {
 		opt.MaxAckWait = maxAckWait
@@ -141,10 +153,32 @@ func WithConsumeFastest(consumeFastest bool) ApplySubOptsFunc {
 	}
 }
 
+// WithContextInjector 设置消息级上下文注入器
+func WithContextInjector(inj ContextInjector) ApplySubOptsFunc {
+	return func(opt *SubscribeOptions) {
+		opt.ContextInjector = inj
+	}
+}
+
+// deriveMessageContext 从订阅级 ctx 派生消息级 ctx：先过注入器，再叠加与 MaxAckWait 对齐的 deadline
+// deadline 与 JetStream AckWait 对齐：处理超时 → ctx 先取消 → handler 快速失败 → Nak，
+// 消除「ctx 存活但 JetStream 已重投」的双活窗口（长事务吊死 + 重投 churn 的根因）
+// Core NATS 模式无重投语义，此 deadline 退化为普通超时熔断
+func deriveMessageContext(ctx context.Context, subOpts SubscribeOptions, msg *nats.Msg) (context.Context, context.CancelFunc) {
+	if subOpts.ContextInjector != nil && msg != nil {
+		ctx = subOpts.ContextInjector(ctx, msg)
+	}
+	if subOpts.MaxAckWait > 0 {
+		return context.WithTimeout(ctx, subOpts.MaxAckWait)
+	}
+	return context.WithCancel(ctx)
+}
+
 // Subscribe 普通事件订阅（QueueSubscribe 负载均衡模式）
 // 同一 queue 组内只有一个消费者收到某条消息，适合任务分发场景
-// 泛型 T 自动反序列化消息体
-func Subscribe[T any](c *Client, eventName, subscriberName string, handleFunc func(evt *T) error, opts ...ApplySubOptsFunc) error {
+// 泛型 T 自动反序列化消息体；ctx 为订阅级基础上下文，取消即停止消费（批量拉取模式下生效），
+// 每条消息的处理 ctx 由库内派生（注入器 + AckWait deadline 对齐）
+func Subscribe[T any](ctx context.Context, c *Client, eventName, subscriberName string, handleFunc func(ctx context.Context, evt *T) error, opts ...ApplySubOptsFunc) error {
 	subOpts := DefaultSubscribeOptions()
 	for _, opt := range opts {
 		opt(&subOpts)
@@ -157,6 +191,10 @@ func Subscribe[T any](c *Client, eventName, subscriberName string, handleFunc fu
 
 	if subOpts.IsIntoGlobalPool && c.WorkerPool() == nil {
 		return ErrGlobalPoolNotInitialized
+	}
+
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
 	c.mu.RLock()
@@ -180,7 +218,7 @@ func Subscribe[T any](c *Client, eventName, subscriberName string, handleFunc fu
 	if !enabledJS {
 		if subOpts.IsListenBroadcast {
 			_, err := conn.Subscribe(eventName, func(msg *nats.Msg) {
-				dispatchConsumer(c, msg, handleFunc, enabledJS, subOpts.IsIntoGlobalPool, localPool, subOpts.MsgMaxRetry, subOpts.MsgRetryInterval)
+				dispatchConsumer(ctx, c, msg, handleFunc, subOpts, enabledJS, localPool)
 			})
 			if err != nil {
 				if localPool != nil {
@@ -192,7 +230,7 @@ func Subscribe[T any](c *Client, eventName, subscriberName string, handleFunc fu
 		}
 
 		_, err := conn.QueueSubscribe(eventName, normalizeConsumerName(eventName+"_"+subscriberName), func(msg *nats.Msg) {
-			dispatchConsumer(c, msg, handleFunc, enabledJS, subOpts.IsIntoGlobalPool, localPool, subOpts.MsgMaxRetry, subOpts.MsgRetryInterval)
+			dispatchConsumer(ctx, c, msg, handleFunc, subOpts, enabledJS, localPool)
 		})
 		if err != nil {
 			if localPool != nil {
@@ -218,7 +256,7 @@ func Subscribe[T any](c *Client, eventName, subscriberName string, handleFunc fu
 
 	if subOpts.IsListenBroadcast {
 		_, err := js.Subscribe(eventName, func(msg *nats.Msg) {
-			dispatchConsumer(c, msg, handleFunc, enabledJS, subOpts.IsIntoGlobalPool, localPool, subOpts.MsgMaxRetry, subOpts.MsgRetryInterval)
+			dispatchConsumer(ctx, c, msg, handleFunc, subOpts, enabledJS, localPool)
 		}, natsOpts...)
 		if err != nil {
 			if localPool != nil {
@@ -230,7 +268,7 @@ func Subscribe[T any](c *Client, eventName, subscriberName string, handleFunc fu
 	}
 
 	_, err := js.QueueSubscribe(eventName, normalizeConsumerName(eventName+"_"+subscriberName), func(msg *nats.Msg) {
-		dispatchConsumer(c, msg, handleFunc, enabledJS, subOpts.IsIntoGlobalPool, localPool, subOpts.MsgMaxRetry, subOpts.MsgRetryInterval)
+		dispatchConsumer(ctx, c, msg, handleFunc, subOpts, enabledJS, localPool)
 	}, natsOpts...)
 	if err != nil {
 		if localPool != nil {
@@ -245,13 +283,13 @@ func Subscribe[T any](c *Client, eventName, subscriberName string, handleFunc fu
 
 // SubscribeBroadcast 广播事件订阅
 // 所有订阅者都收到消息，适合事件通知、状态同步场景
-func SubscribeBroadcast[T any](c *Client, eventName string, handleFunc func(evt *T) error, opts ...ApplySubOptsFunc) error {
-	return Subscribe[T](c, eventName, "", handleFunc, append(opts, WithListenBroadcast())...)
+func SubscribeBroadcast[T any](ctx context.Context, c *Client, eventName string, handleFunc func(ctx context.Context, evt *T) error, opts ...ApplySubOptsFunc) error {
+	return Subscribe[T](ctx, c, eventName, "", handleFunc, append(opts, WithListenBroadcast())...)
 }
 
 // SubscribeStreamBatch 批量流式消费（JetStream Pull 模式）
-// 基于 JetStream PullSubscribe 实现批量拉取消息
-func SubscribeStreamBatch[T any](c *Client, eventName, subscriberName string, handleFunc func(evts []*T) error, opts ...ApplySubOptsFunc) error {
+// 基于 JetStream PullSubscribe 实现批量拉取消息；ctx 取消即停止拉取（优雅停机）
+func SubscribeStreamBatch[T any](ctx context.Context, c *Client, eventName, subscriberName string, handleFunc func(ctx context.Context, evts []*T) error, opts ...ApplySubOptsFunc) error {
 	subOpts := DefaultSubscribeOptions()
 	for _, opt := range opts {
 		opt(&subOpts)
@@ -269,6 +307,10 @@ func SubscribeStreamBatch[T any](c *Client, eventName, subscriberName string, ha
 	}
 	if subOpts.MaxWait <= 0 {
 		subOpts.MaxWait = 10 * time.Second
+	}
+
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
 	c.mu.RLock()
@@ -303,6 +345,14 @@ func SubscribeStreamBatch[T any](c *Client, eventName, subscriberName string, ha
 		}
 
 		for {
+			// 订阅级 ctx 取消 → 停止拉取，优雅停机
+			select {
+			case <-ctx.Done():
+				c.logger.Info("Stream batch consumer stopped", "event", eventName, "subscriber", subscriberName, "reason", ctx.Err())
+				return
+			default:
+			}
+
 			var messages []*nats.Msg
 			start := time.Now()
 			for len(messages) < subOpts.BatchSize {
@@ -331,7 +381,7 @@ func SubscribeStreamBatch[T any](c *Client, eventName, subscriberName string, ha
 			}
 
 			if len(messages) > 0 {
-				dispatchBatchConsumer(c, messages, handleFunc, subOpts.IsIntoGlobalPool, localPool, subOpts.MsgMaxRetry, subOpts.MsgRetryInterval)
+				dispatchBatchConsumer(ctx, c, messages, handleFunc, subOpts, localPool)
 			}
 		}
 	}()
@@ -341,13 +391,16 @@ func SubscribeStreamBatch[T any](c *Client, eventName, subscriberName string, ha
 }
 
 // dispatchConsumer 分发单条消息到消费者池
-func dispatchConsumer[T any](c *Client, msg *nats.Msg, handleFunc func(*T) error, isManualAck bool, isIntoGlobalPool bool, localPool *syncx.WorkerPool, msgMaxRetry uint64, msgRetryInterval time.Duration) {
+func dispatchConsumer[T any](ctx context.Context, c *Client, msg *nats.Msg, handleFunc func(context.Context, *T) error, subOpts SubscribeOptions, isManualAck bool, localPool *syncx.WorkerPool) {
 	task := func() {
+		msgCtx, cancel := deriveMessageContext(ctx, subOpts, msg)
+		defer cancel()
+
 		defer func() {
 			if r := recover(); r != nil {
 				c.logger.Error("Consumer panic recovered: %v, subject: %s", r, msg.Subject)
 				if isManualAck {
-					nakMsg(c, msg, msgMaxRetry, msgRetryInterval)
+					nakMsg(c, msg, subOpts.MsgMaxRetry, subOpts.MsgRetryInterval)
 				}
 			}
 		}()
@@ -356,14 +409,18 @@ func dispatchConsumer[T any](c *Client, msg *nats.Msg, handleFunc func(*T) error
 		if err := jsoniter.Unmarshal(msg.Data, &event); err != nil {
 			c.logger.Error("Unmarshal nats msg failed", "error", err)
 			if isManualAck {
-				nakMsg(c, msg, msgMaxRetry, msgRetryInterval)
+				nakMsg(c, msg, subOpts.MsgMaxRetry, subOpts.MsgRetryInterval)
 			}
 			return
 		}
 
-		if err := handleFunc(&event); err != nil {
+		if err := handleFunc(msgCtx, &event); err != nil {
+			if msgCtx.Err() != nil {
+				// ctx 超时/取消（与 AckWait 对齐）：处理慢于重投窗口，附原因便于定位
+				c.logger.Error("Nats msg handle failed with ctx done", "subject", msg.Subject, "ctx_error", msgCtx.Err(), "error", err)
+			}
 			if isManualAck {
-				nakMsg(c, msg, msgMaxRetry, msgRetryInterval)
+				nakMsg(c, msg, subOpts.MsgMaxRetry, subOpts.MsgRetryInterval)
 			}
 			return
 		}
@@ -375,7 +432,7 @@ func dispatchConsumer[T any](c *Client, msg *nats.Msg, handleFunc func(*T) error
 		}
 	}
 
-	if isIntoGlobalPool {
+	if subOpts.IsIntoGlobalPool {
 		if pool := c.WorkerPool(); pool != nil {
 			_ = pool.SubmitNonBlocking(task)
 		}
@@ -388,20 +445,24 @@ func dispatchConsumer[T any](c *Client, msg *nats.Msg, handleFunc func(*T) error
 }
 
 // dispatchBatchConsumer 分发批量消息到消费者池
-func dispatchBatchConsumer[T any](c *Client, messages []*nats.Msg, handleFunc func([]*T) error, isIntoGlobalPool bool, localPool *syncx.WorkerPool, msgMaxRetry uint64, msgRetryInterval time.Duration) {
+func dispatchBatchConsumer[T any](ctx context.Context, c *Client, messages []*nats.Msg, handleFunc func(context.Context, []*T) error, subOpts SubscribeOptions, localPool *syncx.WorkerPool) {
 	task := func() {
+		// 批量消费以整批为粒度派生 ctx（整批须在一个 AckWait 窗口内完成）
+		msgCtx, cancel := deriveMessageContext(ctx, subOpts, messages[0])
+		defer cancel()
+
 		defer func() {
 			if r := recover(); r != nil {
 				c.logger.Error("Batch consumer panic recovered: %v", r)
 				for _, msg := range messages {
-					nakMsg(c, msg, msgMaxRetry, msgRetryInterval)
+					nakMsg(c, msg, subOpts.MsgMaxRetry, subOpts.MsgRetryInterval)
 				}
 			}
 		}()
-		_ = handleStreamBatch(c, messages, handleFunc, msgMaxRetry, msgRetryInterval)
+		_ = handleStreamBatch(msgCtx, c, messages, handleFunc, subOpts)
 	}
 
-	if isIntoGlobalPool {
+	if subOpts.IsIntoGlobalPool {
 		if pool := c.WorkerPool(); pool != nil {
 			_ = pool.SubmitNonBlocking(task)
 		}
@@ -414,7 +475,7 @@ func dispatchBatchConsumer[T any](c *Client, messages []*nats.Msg, handleFunc fu
 }
 
 // handleStreamBatch 处理批量流式消息
-func handleStreamBatch[T any](c *Client, messages []*nats.Msg, handleFunc func([]*T) error, msgMaxRetry uint64, msgRetryInterval time.Duration) error {
+func handleStreamBatch[T any](ctx context.Context, c *Client, messages []*nats.Msg, handleFunc func(context.Context, []*T) error, subOpts SubscribeOptions) error {
 	var (
 		events        []*T
 		validMessages []*nats.Msg
@@ -424,7 +485,7 @@ func handleStreamBatch[T any](c *Client, messages []*nats.Msg, handleFunc func([
 		event := new(T)
 		if err := jsoniter.Unmarshal(msg.Data, event); err != nil {
 			c.logger.Error("Unmarshal nats msg failed", "error", err)
-			nakMsg(c, msg, msgMaxRetry, msgRetryInterval)
+			nakMsg(c, msg, subOpts.MsgMaxRetry, subOpts.MsgRetryInterval)
 			continue
 		}
 		events = append(events, event)
@@ -435,9 +496,12 @@ func handleStreamBatch[T any](c *Client, messages []*nats.Msg, handleFunc func([
 		return nil
 	}
 
-	if err := handleFunc(events); err != nil {
+	if err := handleFunc(ctx, events); err != nil {
+		if ctx.Err() != nil {
+			c.logger.Error("Nats batch handle failed with ctx done", "ctx_error", ctx.Err(), "error", err)
+		}
 		for _, msg := range validMessages {
-			nakMsg(c, msg, msgMaxRetry, msgRetryInterval)
+			nakMsg(c, msg, subOpts.MsgMaxRetry, subOpts.MsgRetryInterval)
 		}
 		return err
 	}
