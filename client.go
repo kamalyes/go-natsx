@@ -62,11 +62,14 @@ func (c *Client) EnableJetStream() error {
 		return nil
 	}
 
-	js, err := c.conn.JetStream()
-	if err != nil {
-		return err
+	// nats.go 的 JetStream() 不校验连接状态，关闭的连接也会返回可用的上下文，
+	// 但后续所有操作都会失败，这里提前快速失败
+	if c.conn == nil || c.conn.IsClosed() {
+		return ErrNotConnected
 	}
-	c.js = js
+
+	// JetStream() 的错误仅来源于 JSOpt 选项校验，此处不传选项，调用恒成功
+	c.js, _ = c.conn.JetStream()
 	c.logger.Info("JetStream enabled")
 	return nil
 }
@@ -80,10 +83,18 @@ func (c *Client) InitWorkerPool(workers, queueSize int) {
 	if c.worker != nil {
 		return
 	}
-	c.worker = syncx.NewWorkerPool(workers, queueSize, syncx.WithWorkerPoolPanicHandler(func(r interface{}) {
-		c.logger.Error("WorkerPool panic recovered: %v", r)
-	}))
+	c.worker = syncx.NewWorkerPool(workers, queueSize, syncx.WithWorkerPoolPanicHandler(c.globalPoolPanicHandler))
 	c.logger.Info("WorkerPool initialized", "workers", workers, "queueSize", queueSize)
+}
+
+// globalPoolPanicHandler 全局消费者池 panic 处理（任务级 recover 之外的最后防线）
+func (c *Client) globalPoolPanicHandler(r interface{}) {
+	c.logger.Error("WorkerPool panic recovered: %v", r)
+}
+
+// consumerPoolPanicHandler 局部消费者池 panic 处理（任务级 recover 之外的最后防线）
+func (c *Client) consumerPoolPanicHandler(r interface{}) {
+	c.logger.Error("Local consumer pool panic recovered: %v", r)
 }
 
 // WorkerPool 返回全局 WorkerPool

@@ -55,13 +55,47 @@ natsx.WithMsgMaxRetry(5)
 
 默认值：3仅 JetStream 模式有效，超过此次数后消息被 Term
 
+### WithUnlimitedDelivery - 无限重投模式
+
+```go
+natsx.WithUnlimitedDelivery()
+```
+
+等价于 `WithMsgMaxRetry(0)`：除 `ErrPermanent` 永久性失败外永不 Term，消息无限重投直至成功，适合不容忍丢消息的关键业务
+
+### WithRetryBackoff - 指数退避重试策略
+
+```go
+natsx.WithRetryBackoff(natsx.Backoff{
+    Base:   time.Second,       // 首次重试延迟
+    Max:    30 * time.Second,  // 延迟上限
+    Factor: 2,                 // 指数因子（<=0 时按 2.0 处理）
+    Jitter: true,              // 叠加 0~1 倍随机抖动，避免重投风暴同步
+})
+```
+
+设置后退避计算优先于 `WithMsgRetryInterval` 固定间隔，未设置时 `RetryBackoff` 为 nil 不生效。内部已处理大投递次数下的指数溢出截断，不会产生负延迟
+
+### WithContextInjector - 消息级上下文注入器
+
+```go
+natsx.WithContextInjector(func(ctx context.Context, msg *nats.Msg) context.Context {
+    if traceID := msg.Header.Get("X-Trace-Id"); traceID != "" {
+        ctx = gwMiddleware.WithTraceID(ctx, traceID)
+    }
+    return ctx
+})
+```
+
+每条消息分发前调用，用于从消息 Header 继承跨服务上下文（如 trace_id）。依赖倒置设计，库自身不感知具体实现，由应用侧传入
+
 ### WithMsgRetryInterval - 消息重试间隔
 
 ```go
 natsx.WithMsgRetryInterval(2*time.Second)
 ```
 
-默认值：1s仅 JetStream 模式有效，NAK 时的延迟重试时间
+默认值：1s仅 JetStream 模式有效，NAK 时的延迟重试时间，设置了 `WithRetryBackoff` 后被退避计算取代
 
 ### WithMaxAckWait - 消息最长消费时间
 
@@ -104,6 +138,8 @@ natsx.WithConsumeFastest(true)
 | BatchSize | 100 | StreamBatch |
 | MaxWait | 10s | StreamBatch |
 | MsgMaxRetry | 3 | JetStream |
+| RetryBackoff | nil（未启用） | JetStream |
+| ContextInjector | nil（未启用） | 所有订阅 |
 | MsgRetryInterval | 1s | JetStream |
 | MaxAckWait | 30s | JetStream |
 | IdleHeartbeat | 0 | JetStream |
@@ -119,7 +155,9 @@ err := natsx.Subscribe[OrderEvent](client, "order.created", "svc", handler,
     natsx.WithIntoGlobalPool(),
     natsx.WithMaxAckWait(60*time.Second),
     natsx.WithMsgMaxRetry(5),
-    natsx.WithMsgRetryInterval(3*time.Second),
+    natsx.WithRetryBackoff(natsx.Backoff{
+        Base: time.Second, Max: 30 * time.Second, Factor: 2, Jitter: true,
+    }),
 )
 ```
 

@@ -725,12 +725,10 @@ func TestSubscribe_TemporaryError_RetriesWithBackoff(t *testing.T) {
 
 	subject := streamName + ".backoff"
 	var attempts atomic.Int32
-	var firstDelivery atomic.Int64
 
 	err := Subscribe(context.Background(), client, subject, "testing_backoff",
 		func(ctx context.Context, evt *TestEvent) error {
 			if attempts.Add(1) == 1 {
-				firstDelivery.Store(time.Now().UnixMilli())
 				return errors.New("transient: db lock timeout") // 临时错误：应 Nak 重投
 			}
 			return nil // 第二次成功
@@ -747,4 +745,432 @@ func TestSubscribe_TemporaryError_RetriesWithBackoff(t *testing.T) {
 	time.Sleep(2 * time.Second)
 	assert.GreaterOrEqual(t, attempts.Load(), int32(2),
 		"transient error should be redelivered via Nak (attempts=%d)", attempts.Load())
+}
+
+// TestSubscribe_NilContext 测试 nil ctx 兜底为 Background
+func TestSubscribe_NilContext(t *testing.T) {
+	client, conn := newConnectedClient(t)
+	defer client.Close()
+	defer conn.Close()
+
+	type TestEvent struct {
+		Name string `json:"name"`
+	}
+
+	// gochecknogints 场景由库内兜底，lint 用 nil 切片规避
+	var nilCtx context.Context //nolint:staticcheck // 测试 nil ctx 兜底分支
+	err := Subscribe(nilCtx, client, uniqueSubject("test.nilctx"), "testing",
+		func(ctx context.Context, evt *TestEvent) error { return nil })
+	assert.NoError(t, err)
+}
+
+// TestSubscribe_CoreNATS_InvalidSubject 测试 Core NATS 订阅非法 subject（广播 + 队列两分支）
+func TestSubscribe_CoreNATS_InvalidSubject(t *testing.T) {
+	client, conn := newConnectedClient(t)
+	defer client.Close()
+	defer conn.Close()
+
+	type TestEvent struct {
+		Name string `json:"name"`
+	}
+
+	// 广播分支
+	err := SubscribeBroadcast(context.Background(), client, "", func(ctx context.Context, evt *TestEvent) error {
+		return nil
+	})
+	assert.ErrorIs(t, err, ErrSubscribeFailed)
+
+	// 队列分支
+	err = Subscribe(context.Background(), client, "", "testing", func(ctx context.Context, evt *TestEvent) error {
+		return nil
+	})
+	assert.ErrorIs(t, err, ErrSubscribeFailed)
+}
+
+// TestSubscribe_JetStream_InvalidSubject 测试 JetStream 订阅非法 subject（广播 + 队列两分支）
+func TestSubscribe_JetStream_InvalidSubject(t *testing.T) {
+	client, conn := newConnectedClientWithJS(t)
+	defer client.Close()
+	defer conn.Close()
+
+	type TestEvent struct {
+		Name string `json:"name"`
+	}
+
+	// 广播分支
+	err := SubscribeBroadcast(context.Background(), client, "", func(ctx context.Context, evt *TestEvent) error {
+		return nil
+	})
+	assert.ErrorIs(t, err, ErrSubscribeFailed)
+
+	// 队列分支
+	err = Subscribe(context.Background(), client, "", "testing", func(ctx context.Context, evt *TestEvent) error {
+		return nil
+	})
+	assert.ErrorIs(t, err, ErrSubscribeFailed)
+}
+
+// TestSubscribeStreamBatch_NilContextAndDefaults 测试批量订阅的兜底分支（nil ctx / 零值批量参数 / 广播覆盖）
+func TestSubscribeStreamBatch_NilContextAndDefaults(t *testing.T) {
+	client, conn := newConnectedClientWithJS(t)
+	defer client.Close()
+	defer conn.Close()
+
+	streamName := "TEST_BATCH_DEFAULTS"
+	ensureStream(t, client, streamName)
+
+	type TestEvent struct {
+		Name string `json:"name"`
+	}
+
+	var nilCtx context.Context //nolint:staticcheck // 测试 nil ctx 兜底分支
+	err := SubscribeStreamBatch(nilCtx, client, streamName+".defaults", "testing",
+		func(ctx context.Context, evts []*TestEvent) error { return nil },
+		WithListenBroadcast(), // 触发广播覆盖分支
+		WithBatchSize(0),      // 触发 BatchSize<=0 兜底
+		WithMaxWait(0),        // 触发 MaxWait<=0 兜底
+	)
+	assert.NoError(t, err)
+}
+
+// TestSubscribeStreamBatch_InvalidSubject 测试批量订阅非法 subject
+func TestSubscribeStreamBatch_InvalidSubject(t *testing.T) {
+	client, conn := newConnectedClientWithJS(t)
+	defer client.Close()
+	defer conn.Close()
+
+	type TestEvent struct {
+		Name string `json:"name"`
+	}
+
+	err := SubscribeStreamBatch(context.Background(), client, "", "testing",
+		func(ctx context.Context, evts []*TestEvent) error { return nil })
+	assert.ErrorIs(t, err, ErrSubscribeFailed)
+}
+
+// TestSubscribeStreamBatch_ContextCancel 测试订阅级 ctx 取消后拉取循环退出
+func TestSubscribeStreamBatch_ContextCancel(t *testing.T) {
+	client, conn := newConnectedClientWithJS(t)
+	defer client.Close()
+	defer conn.Close()
+
+	streamName := "TEST_BATCH_CANCEL"
+	ensureStream(t, client, streamName)
+
+	type TestEvent struct {
+		Name string `json:"name"`
+	}
+	var handled atomic.Bool
+
+	ctx, cancel := context.WithCancel(context.Background())
+	err := SubscribeStreamBatch(ctx, client, streamName+".cancel", "testing",
+		func(c context.Context, evts []*TestEvent) error {
+			handled.Store(true)
+			return nil
+		},
+		WithMaxWait(100*time.Millisecond),
+	)
+	assert.NoError(t, err)
+
+	cancel() // 立即取消：拉取循环应感知并退出
+	time.Sleep(300 * time.Millisecond)
+
+	// 取消后投递的消息不应被消费
+	_ = PublishEvent(client, streamName+".cancel", &TestEvent{Name: "late"})
+	time.Sleep(200 * time.Millisecond)
+	assert.False(t, handled.Load(), "cancelled subscription should not consume messages")
+}
+
+// TestSubscribeStreamBatch_ConsumeFastest 测试 ConsumeFastest 分支（拉到即分发）
+func TestSubscribeStreamBatch_ConsumeFastest(t *testing.T) {
+	client, conn := newConnectedClientWithJS(t)
+	defer client.Close()
+	defer conn.Close()
+
+	streamName := "TEST_BATCH_FASTEST"
+	ensureStream(t, client, streamName)
+
+	type TestEvent struct {
+		Name string `json:"name"`
+	}
+	var handled atomic.Bool
+
+	err := SubscribeStreamBatch(context.Background(), client, streamName+".fastest", "testing",
+		func(c context.Context, evts []*TestEvent) error {
+			handled.Store(true)
+			return nil
+		},
+		WithConsumeFastest(true),
+		WithMaxWait(200*time.Millisecond),
+	)
+	assert.NoError(t, err)
+
+	_ = PublishEvent(client, streamName+".fastest", &TestEvent{Name: "fast"})
+	assert.Eventually(t, func() bool { return handled.Load() }, 3*time.Second, 50*time.Millisecond)
+}
+
+// TestSubscribe_InvalidJSON_TerminatesMessage 测试消息体损坏走 ErrPermanent 终止（单条路径）
+func TestSubscribe_InvalidJSON_TerminatesMessage(t *testing.T) {
+	client, conn := newConnectedClientWithJS(t)
+	defer client.Close()
+	defer conn.Close()
+
+	streamName := "TEST_INVALID_JSON"
+	ensureStream(t, client, streamName)
+
+	type TestEvent struct {
+		Name string `json:"name"`
+	}
+	var handled atomic.Bool
+
+	err := Subscribe(context.Background(), client, streamName+".badjson", "testing_badjson",
+		func(ctx context.Context, evt *TestEvent) error {
+			handled.Store(true)
+			return nil
+		},
+		WithMaxAckWait(5*time.Second),
+	)
+	assert.NoError(t, err)
+
+	// 直接发布非法 JSON：反序列化失败 → ErrPermanent → Term
+	js := client.JetStream()
+	_, err = js.Publish(streamName+".badjson", []byte(`{not-json`))
+	assert.NoError(t, err)
+
+	time.Sleep(1 * time.Second)
+	assert.False(t, handled.Load(), "handler should never see unparseable message")
+}
+
+// TestSubscribe_HandlerPanic_RecoveredAndTerminated 测试 handler panic 被 recover 并按重试上限终止
+func TestSubscribe_HandlerPanic_RecoveredAndTerminated(t *testing.T) {
+	client, conn := newConnectedClientWithJS(t)
+	defer client.Close()
+	defer conn.Close()
+
+	streamName := "TEST_PANIC_JS"
+	ensureStream(t, client, streamName)
+
+	type TestEvent struct {
+		Name string `json:"name"`
+	}
+	var attempts atomic.Int32
+
+	err := Subscribe(context.Background(), client, streamName+".panic", "testing_panic",
+		func(ctx context.Context, evt *TestEvent) error {
+			attempts.Add(1)
+			panic("handler exploded") // 模拟消费 panic
+		},
+		WithMaxAckWait(5*time.Second),
+		WithMsgMaxRetry(2), // 第 3 次投递超限 → Term
+	)
+	assert.NoError(t, err)
+
+	_ = PublishEvent(client, streamName+".panic", &TestEvent{Name: "boom"})
+
+	// 等待重试链完成：3 次投递后 Term，attempts 稳定在 3
+	assert.Eventually(t, func() bool { return attempts.Load() >= 3 }, 5*time.Second, 50*time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
+	assert.Equal(t, int32(3), attempts.Load(), "should terminate after exceeding MsgMaxRetry")
+}
+
+// TestHandleStreamBatch_Direct 分支直测：全非法批 / handler 错误 / ctx 取消 / Ack 失败
+func TestHandleStreamBatch_Direct(t *testing.T) {
+	client, conn := newConnectedClient(t)
+	defer client.Close()
+	defer conn.Close()
+
+	type TestEvent struct {
+		Name string `json:"name"`
+	}
+
+	validMsg := &nats.Msg{Subject: "s", Data: []byte(`{"name":"x"}`)}
+	invalidMsg := &nats.Msg{Subject: "s", Data: []byte(`{not-json`)}
+
+	// ① 全非法批：events 为空 → 直接返回 nil（不调 handler）
+	err := handleStreamBatch[TestEvent](context.Background(), client, []*nats.Msg{invalidMsg, invalidMsg},
+		func(ctx context.Context, evts []*TestEvent) error {
+			t.Fatal("handler should not be called for all-invalid batch")
+			return nil
+		}, SubscribeOptions{})
+	assert.NoError(t, err)
+
+	// ② handler 返回错误：整批 Nak（裸消息 Nak 失败仅记日志，不 panic）
+	err = handleStreamBatch[TestEvent](context.Background(), client, []*nats.Msg{validMsg},
+		func(ctx context.Context, evts []*TestEvent) error { return errors.New("batch failed") },
+		SubscribeOptions{})
+	assert.Error(t, err)
+
+	// ③ handler 错误且 ctx 已取消：记录 ctx 原因分支
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = handleStreamBatch[TestEvent](cancelledCtx, client, []*nats.Msg{validMsg},
+		func(ctx context.Context, evts []*TestEvent) error { return errors.New("ctx done failure") },
+		SubscribeOptions{})
+	assert.Error(t, err)
+
+	// ④ 成功路径 + 裸消息 Ack 失败（无 Sub 绑定）：仅记日志，返回 nil
+	err = handleStreamBatch[TestEvent](context.Background(), client, []*nats.Msg{validMsg},
+		func(ctx context.Context, evts []*TestEvent) error { return nil },
+		SubscribeOptions{})
+	assert.NoError(t, err)
+}
+
+// ---------- nakMsgWithOpts 应答决策表分支 ----------
+
+// TestNakMsgWithOpts_PermanentTermError 测试 ErrPermanent 分支的 Term 失败日志（裸消息无绑定）
+func TestNakMsgWithOpts_PermanentTermError(t *testing.T) {
+	client, conn := newConnectedClient(t)
+	defer client.Close()
+	defer conn.Close()
+
+	bare := &nats.Msg{Subject: "s", Data: []byte(`{}`)}
+	// 裸消息 Term 返回 ErrMsgNotBound → 仅记日志，不 panic
+	assert.NotPanics(t, func() {
+		nakMsgWithOpts(client, bare, SubscribeOptions{}, ErrPermanent)
+	})
+}
+
+// TestNakMsgWithOpts_ImmediateNakError 测试零延迟立即 Nak 分支 + Nak 失败日志
+func TestNakMsgWithOpts_ImmediateNakError(t *testing.T) {
+	client, conn := newConnectedClient(t)
+	defer client.Close()
+	defer conn.Close()
+
+	bare := &nats.Msg{Subject: "s", Data: []byte(`{}`)}
+	// 无退避无间隔 → msg.Nak()；裸消息返回 ErrMsgNotBound → 仅记日志
+	assert.NotPanics(t, func() {
+		nakMsgWithOpts(client, bare, SubscribeOptions{}, errors.New("transient"))
+	})
+	// 显式零间隔（MsgMaxRetry>0 且无元数据 → 跳过 Term 走 Nak）
+	assert.NotPanics(t, func() {
+		nakMsgWithOpts(client, bare, SubscribeOptions{MsgMaxRetry: 3, MsgRetryInterval: 0}, errors.New("transient"))
+	})
+}
+
+// TestSubscribe_ExceedMaxRetry_Terminated 测试超过最大重试次数后 Term（真实 JetStream 投递计数）
+func TestSubscribe_ExceedMaxRetry_Terminated(t *testing.T) {
+	client, conn := newConnectedClientWithJS(t)
+	defer client.Close()
+	defer conn.Close()
+
+	streamName := "TEST_MAXRETRY_JS"
+	ensureStream(t, client, streamName)
+
+	type TestEvent struct {
+		Name string `json:"name"`
+	}
+	var attempts atomic.Int32
+
+	err := Subscribe(context.Background(), client, streamName+".maxretry", "testing_maxretry",
+		func(ctx context.Context, evt *TestEvent) error {
+			attempts.Add(1)
+			return errors.New("always fails") // 普通临时错误：Nak 重投
+		},
+		WithMaxAckWait(5*time.Second),
+		WithMsgMaxRetry(1), // 第 2 次投递 NumDelivered=2 > 1 → Term
+	)
+	assert.NoError(t, err)
+
+	_ = PublishEvent(client, streamName+".maxretry", &TestEvent{Name: "fail-me"})
+
+	assert.Eventually(t, func() bool { return attempts.Load() >= 2 }, 5*time.Second, 50*time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
+	assert.Equal(t, int32(2), attempts.Load(), "should terminate when NumDelivered exceeds MsgMaxRetry")
+}
+
+// TestSubscribeBroadcast_ReceiveMessage_JetStream 测试 JetStream 广播订阅接收消息（覆盖 js.Subscribe 广播分发闭包）
+func TestSubscribeBroadcast_ReceiveMessage_JetStream(t *testing.T) {
+	client, conn := newConnectedClientWithJS(t)
+	defer client.Close()
+	defer conn.Close()
+
+	streamName := "TEST_BROADCAST_JS_RECV"
+	ensureStream(t, client, streamName)
+
+	type TestEvent struct {
+		Name string `json:"name"`
+	}
+
+	subject := streamName + ".recv"
+	var received atomic.Int32
+
+	err := SubscribeBroadcast(context.Background(), client, subject, func(ctx context.Context, evt *TestEvent) error {
+		received.Add(1)
+		return nil
+	}, WithMaxAckWait(5*time.Second))
+	assert.NoError(t, err)
+
+	_ = PublishEvent(client, subject, &TestEvent{Name: "hello"})
+
+	assert.Eventually(t, func() bool { return received.Load() >= 1 }, 5*time.Second, 50*time.Millisecond)
+}
+
+// TestDispatchConsumer_AckError 分支直测：handler 成功但裸消息 Ack 失败（无 Sub 绑定，仅记日志）
+func TestDispatchConsumer_AckError(t *testing.T) {
+	client, conn := newConnectedClient(t)
+	defer client.Close()
+	defer conn.Close()
+	client.InitWorkerPool(2, 10)
+
+	type TestEvent struct {
+		Name string `json:"name"`
+	}
+
+	var handled atomic.Bool
+	// 裸消息无 Sub 绑定 → Ack 返回 ErrMsgNotBound → 仅记日志不 panic
+	dispatchConsumer[TestEvent](context.Background(), client,
+		&nats.Msg{Subject: "s", Data: []byte(`{"name":"x"}`)},
+		func(ctx context.Context, evt *TestEvent) error {
+			handled.Store(true)
+			return nil
+		},
+		SubscribeOptions{IsIntoGlobalPool: true}, true, nil)
+
+	client.WorkerPool().Wait()
+	assert.True(t, handled.Load())
+}
+
+// TestDispatchBatchConsumer_PanicAndGlobalPool 分支直测：批量 handler panic 恢复 + 全局池分发
+func TestDispatchBatchConsumer_PanicAndGlobalPool(t *testing.T) {
+	client, conn := newConnectedClient(t)
+	defer client.Close()
+	defer conn.Close()
+	client.InitWorkerPool(2, 10)
+
+	type TestEvent struct {
+		Name string `json:"name"`
+	}
+
+	// panic 被任务级 recover 捕获 → 整批 Nak（裸消息 Nak 失败仅记日志），不冒泡到池
+	assert.NotPanics(t, func() {
+		dispatchBatchConsumer[TestEvent](context.Background(), client,
+			[]*nats.Msg{{Subject: "s", Data: []byte(`{}`)}},
+			func(ctx context.Context, evts []*TestEvent) error { panic("boom") },
+			SubscribeOptions{IsIntoGlobalPool: true}, nil)
+	})
+	client.WorkerPool().Wait()
+}
+
+// TestNakMsgWithOpts_MaxRetryTermError 分支直测：超过最大重试走 Term，Term 失败仅记日志
+func TestNakMsgWithOpts_MaxRetryTermError(t *testing.T) {
+	client, conn := newConnectedClient(t)
+	defer client.Close()
+
+	// 绑定真实 Sub 使 Metadata() 可解析（Reply 为合法 v1 格式，NumDelivered=3）
+	sub, err := conn.SubscribeSync("nak.maxretry.term")
+	assert.NoError(t, err)
+
+	msg := &nats.Msg{
+		Subject: "nak.maxretry.term",
+		Reply:   "$JS.ACK.TEST_STREAM.TEST_CONS.3.10.3.1700000000000000000.0", // NumDelivered=3
+		Data:    []byte(`{}`),
+		Sub:     sub,
+	}
+
+	// 关闭连接：Metadata 为纯本地解析仍成功，Term 的同步请求因连接关闭而快速失败
+	conn.Close()
+	// Metadata.NumDelivered=3 > MsgMaxRetry=1 → 走 Term；Term 失败仅记日志不 panic
+	assert.NotPanics(t, func() {
+		nakMsgWithOpts(client, msg, SubscribeOptions{MsgMaxRetry: 1}, errors.New("transient"))
+	})
 }

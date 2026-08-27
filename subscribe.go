@@ -241,9 +241,7 @@ func Subscribe[T any](ctx context.Context, c *Client, eventName, subscriberName 
 
 	var localPool *syncx.WorkerPool
 	if !subOpts.IsIntoGlobalPool {
-		localPool = syncx.NewWorkerPool(subOpts.LocalPoolSize, subOpts.LocalPoolQueueSize, syncx.WithWorkerPoolPanicHandler(func(r interface{}) {
-			c.logger.Error("Local consumer pool panic recovered: %v", r)
-		}))
+		localPool = syncx.NewWorkerPool(subOpts.LocalPoolSize, subOpts.LocalPoolQueueSize, syncx.WithWorkerPoolPanicHandler(c.consumerPoolPanicHandler))
 	}
 
 	if !enabledJS {
@@ -354,9 +352,7 @@ func SubscribeStreamBatch[T any](ctx context.Context, c *Client, eventName, subs
 
 	var localPool *syncx.WorkerPool
 	if !subOpts.IsIntoGlobalPool {
-		localPool = syncx.NewWorkerPool(subOpts.LocalPoolSize, subOpts.LocalPoolQueueSize, syncx.WithWorkerPoolPanicHandler(func(r interface{}) {
-			c.logger.Error("Local consumer pool panic recovered: %v", r)
-		}))
+		localPool = syncx.NewWorkerPool(subOpts.LocalPoolSize, subOpts.LocalPoolQueueSize, syncx.WithWorkerPoolPanicHandler(c.consumerPoolPanicHandler))
 	}
 
 	sub, err := js.PullSubscribe(eventName, normalizeConsumerName(eventName+"_"+subscriberName))

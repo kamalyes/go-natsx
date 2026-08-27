@@ -161,3 +161,70 @@ func TestPublishJetStream_Success(t *testing.T) {
 	assert.Equal(t, "TEST_JS_PUB", ack.Stream)
 	assert.Greater(t, ack.Sequence, uint64(0))
 }
+
+// TestPublish_ClosedConn 测试连接关闭后发布失败
+func TestPublish_ClosedConn(t *testing.T) {
+	client, conn := newConnectedClient(t)
+	defer client.Close()
+	conn.Close()
+
+	err := client.Publish(context.Background(), "test.publish", []byte(`{}`))
+	assert.ErrorIs(t, err, ErrPublishFailed)
+}
+
+// TestPublishEvent_MarshalError 测试不可序列化事件（channel 字段）
+func TestPublishEvent_MarshalError(t *testing.T) {
+	client, conn := newConnectedClient(t)
+	defer client.Close()
+	defer conn.Close()
+
+	type BadEvent struct {
+		Ch chan int `json:"ch"`
+	}
+	err := PublishEvent(client, "test.marshal", &BadEvent{Ch: make(chan int)})
+	assert.ErrorIs(t, err, ErrPublishFailed)
+	assert.Contains(t, err.Error(), "marshal failed")
+}
+
+// TestPublishEvent_PublishError 测试事件发布失败（空 subject）
+func TestPublishEvent_PublishError(t *testing.T) {
+	client, conn := newConnectedClient(t)
+	defer client.Close()
+	defer conn.Close()
+
+	type TestEvent struct {
+		Name string `json:"name"`
+	}
+	err := PublishEvent(client, "", &TestEvent{Name: "x"})
+	assert.ErrorIs(t, err, ErrPublishFailed)
+}
+
+// TestPublishWithRetry_Failure 测试带重试发布失败（连接关闭）
+func TestPublishWithRetry_Failure(t *testing.T) {
+	client, conn := newConnectedClient(t)
+	defer client.Close()
+	conn.Close()
+
+	err := client.PublishWithRetry(context.Background(), "test.retry", []byte(`{}`), 2, 10*time.Millisecond)
+	assert.ErrorIs(t, err, ErrPublishFailed)
+}
+
+// TestRequest_NoResponder 测试请求无响应者超时
+func TestRequest_NoResponder(t *testing.T) {
+	client, conn := newConnectedClient(t)
+	defer client.Close()
+	defer conn.Close()
+
+	_, err := client.Request(context.Background(), uniqueSubject("test.noexist"), []byte(`{}`), 100*time.Millisecond)
+	assert.ErrorIs(t, err, ErrPublishFailed)
+}
+
+// TestPublishJetStream_Error 测试 JetStream 发布失败（空 subject）
+func TestPublishJetStream_Error(t *testing.T) {
+	client, conn := newConnectedClientWithJS(t)
+	defer client.Close()
+	defer conn.Close()
+
+	_, err := client.PublishJetStream(context.Background(), "", []byte(`{}`))
+	assert.ErrorIs(t, err, ErrPublishFailed)
+}

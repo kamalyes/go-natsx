@@ -13,6 +13,7 @@ package natsx
 import (
 	"testing"
 
+	"github.com/kamalyes/go-logger"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -171,4 +172,37 @@ func TestClient_IsConnected(t *testing.T) {
 	conn.Close()
 
 	assert.False(t, client.IsConnected())
+}
+
+// TestNewClient_CustomLogger 测试自定义 logger 注入分支
+func TestNewClient_CustomLogger(t *testing.T) {
+	client, conn := newConnectedClient(t)
+	defer client.Close()
+	defer conn.Close()
+
+	custom := logger.New()
+	client2, err := NewClient(conn, custom)
+	assert.NoError(t, err)
+	assert.NotNil(t, client2)
+}
+
+// TestEnableJetStream_ClosedConn 测试连接已关闭时启用 JetStream 失败
+func TestEnableJetStream_ClosedConn(t *testing.T) {
+	client, conn := newConnectedClient(t)
+	defer client.Close()
+	conn.Close() // 提前关闭连接，使 JetStream() 返回错误
+
+	err := client.EnableJetStream()
+	assert.Error(t, err, "closed conn should fail JetStream init")
+}
+
+// TestClientPoolPanicHandlers 测试池 panic 处理方法（命名方法便于直接覆盖）
+func TestClientPoolPanicHandlers(t *testing.T) {
+	client, conn := newConnectedClient(t)
+	defer client.Close()
+	defer conn.Close()
+
+	// 不 panic 即为通过（验证日志调用不崩）
+	client.globalPoolPanicHandler("boom-global")
+	client.consumerPoolPanicHandler("boom-local")
 }

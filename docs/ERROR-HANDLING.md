@@ -18,6 +18,7 @@ go-natsx 定义了结构化的错误变量，支持 `errors.Is` 检查
 | `ErrTimeout` | 操作超时 |
 | `ErrUnavailable` | 服务不可用 |
 | `ErrGlobalPoolNotInitialized` | 全局消费者池未初始化 |
+| `ErrPermanent` | 永久性失败哨兵（handler 返回时消息直接 Term，不再重投） |
 
 ## 错误检查
 
@@ -78,37 +79,41 @@ if err != nil {
 
 ## 消息处理错误
 
-在 JetStream 模式下，`handleFunc` 返回的错误会影响消息确认：
+在 JetStream 模式下，`handleFunc` 返回的错误按应答决策表处理：
 
 ```go
 natsx.Subscribe[OrderEvent](client, "order.created", "svc",
     func(evt *OrderEvent) error {
+        if evt.OrderNo == "" {
+            // 永久性失败 → 消息直接 Term，不再重投
+            return fmt.Errorf("%w: order not found", natsx.ErrPermanent)
+        }
         if err := processOrder(evt); err != nil {
-            // 返回 error → 消息 NAK，等待重试
+            // 临时错误 → 消息 NAK，按退避策略重投
             return err
         }
         // 返回 nil → 消息 ACK
         return nil
     },
     natsx.WithMsgMaxRetry(3),
-    natsx.WithMsgRetryInterval(time.Second),
+    natsx.WithRetryBackoff(natsx.Backoff{Base: time.Second, Max: 30 * time.Second, Factor: 2}),
 )
 ```
 
 ### 反序列化错误
 
-消息反序列化失败时：
+消息反序列化失败时（消息体损坏，重试不可修复）：
 - Core NATS 模式：记录错误日志，消息被丢弃
-- JetStream 模式：消息 NAK，等待重试
+- JetStream 模式：按 `ErrPermanent` 处理，消息直接 Term
 
 ### 超过重试次数
 
-超过 `MsgMaxRetry` 后，消息被 Term，不再重试：
+超过 `MsgMaxRetry` 后，消息被 Term，不再重试（`WithUnlimitedDelivery` 无限重投模式下永不 Term）：
 
 ```go
-nakMsg(c, msg, msgMaxRetry, msgRetryInterval)
-// 内部逻辑：
-// 1. 检查消息投递次数
-// 2. 如果超过 msgMaxRetry → msg.Term()
-// 3. 否则 → msg.NakWithDelay(msgRetryInterval)
+nakMsgWithOpts(c, msg, subOpts, err)
+// 应答决策表：
+// 1. err 命中 ErrPermanent → msg.Term()（永久失败，重试不可修复）
+// 2. 投递次数超过 MsgMaxRetry → msg.Term()（重试上限）
+// 3. 其他 → NakWithDelay(退避策略) 重投，未配置退避则按 MsgRetryInterval 固定间隔
 ```
