@@ -273,7 +273,20 @@ func TestDeriveMessageContext_InjectorAndDeadline(t *testing.T) {
 	assert.WithinDuration(t, time.Now().Add(50*time.Millisecond), dl, 20*time.Millisecond)
 
 	// 超时后 ctx 取消（模拟「处理慢于重投窗口」的快速失败）
-	time.Sleep(60 * time.Millisecond)
+	//
+	// 等 Done 而不是 sleep 固定时长：原先是 sleep 60ms 去赌一个 50ms 的 deadline 已经生效，
+	// 只有 10ms 余量，而 WithDeadline 的 Err() 要等定时器 goroutine 被调度到才会填上。
+	// 在带 -race 的共享 runner 上这点余量不够，于是 Err() 还是 nil，测试随机失败
+	// 等 Done 是确定的：deadline 到了就立刻返回，没到就最多等 2 秒再判失败
+	//
+	// [EN] Waiting on Done instead of sleeping a fixed span. The original slept 60ms to bet that
+	// a 50ms deadline had already taken effect, a 10ms margin, while Err() is only populated once
+	// the deadline timer's goroutine is scheduled -- not reliable on a shared runner under -race
+	select {
+	case <-derived.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("message ctx 没有在 MaxAckWait 之后取消")
+	}
 	assert.ErrorIs(t, derived.Err(), context.DeadlineExceeded)
 }
 
