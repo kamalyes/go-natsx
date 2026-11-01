@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/json-iterator/go v1.1.12
 	github.com/kamalyes/go-logger v0.9.0
-	github.com/kamalyes/go-toolbox v0.19.0
+	github.com/kamalyes/go-toolbox v0.19.1
 	github.com/nats-io/nats-server/v2 v2.11.0
 	github.com/nats-io/nats.go v1.39.1
 	github.com/stretchr/testify v1.12.1
@@ -14,7 +14,7 @@ require (
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/google/go-tpm v0.9.3 // indirect
-	github.com/kamalyes/go-argus v0.5.0 // indirect
+	github.com/kamalyes/go-argus v0.5.1 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/minio/highwayhash v1.0.3 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
